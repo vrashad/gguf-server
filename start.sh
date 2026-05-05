@@ -2,12 +2,20 @@
 # =============================================================================
 # Entrypoint for the GGUF server (Salad / Vast.ai / VPS / bare-metal).
 #
-# Responsibilities:
+# What this does:
 #   1. Resolve model configuration from environment variables.
 #   2. Download the GGUF model from Hugging Face if not already cached.
-#   3. Start llama-server on 127.0.0.1:8081 (internal only).
-#   4. Start the FastAPI auth proxy on 0.0.0.0:8080 (public).
-#   5. Wait for either process and exit if any dies.
+#   3. Start llama-server on 127.0.0.1:LLAMA_INTERNAL_PORT (loopback only).
+#   4. Wait until llama-server is ready.
+#   5. Start the FastAPI auth proxy on [::]:PUBLIC_PORT (IPv4 + IPv6).
+#   6. Wait for either process to exit; clean up on shutdown.
+#
+# Performance notes:
+#   - For MoE models (Qwen3.x-A3B, GPT-OSS, etc.) on small GPUs, set
+#     OFFLOAD_MODE=cmoe — it pushes all expert tensors to CPU, leaves
+#     attention on GPU, and runs ~2-3x faster than naive layer offload.
+#   - BATCH_SIZE/UBATCH_SIZE default to 4096 for ~5x faster prefill at the
+#     cost of ~3 GB extra VRAM. Drop to 2048 if VRAM is tight.
 # =============================================================================
 
 set -euo pipefail
@@ -16,49 +24,46 @@ set -euo pipefail
 # Configuration (all optional; sensible defaults provided)
 # -----------------------------------------------------------------------------
 
-# Hugging Face repo with GGUF files.
+# --- Model selection ---
 MODEL_REPO="${MODEL_REPO:-unsloth/Qwen3.6-35B-A3B-GGUF}"
-
-# Glob pattern for the main model file.
 MODEL_PATTERN="${MODEL_PATTERN:-*UD-Q4_K_XL*}"
-
-# Glob for multimodal projector (leave empty for text-only models).
 MMPROJ_PATTERN="${MMPROJ_PATTERN:-}"
-
-# Model alias exposed via the OpenAI API.
 MODEL_ALIAS="${MODEL_ALIAS:-$(basename "${MODEL_REPO}")}"
-
-# Where to cache models. Mount a persistent volume here on platforms
-# that support it (Salad container storage, Vast.ai mounted volumes).
 MODEL_DIR="${MODEL_DIR:-/data/models}"
 
-# llama-server runtime parameters
+# --- llama-server runtime ---
 LLAMA_INTERNAL_PORT="${LLAMA_INTERNAL_PORT:-8081}"
 CTX_SIZE="${CTX_SIZE:-16384}"
-N_GPU_LAYERS="${N_GPU_LAYERS:-999}"
+
+# Offload strategy:
+#   auto   - llama.cpp picks ngl/cmoe/ncmoe automatically (recommended)
+#   ngl    - classic --n-gpu-layers (best for Dense models that fit)
+#   cmoe   - all MoE experts to CPU, attention on GPU (small GPU + MoE)
+#   ncmoe  - move N MoE layers to CPU; needs OFFLOAD_VALUE
+#   manual - skip auto-offload; rely on EXTRA_ARGS
+OFFLOAD_MODE="${OFFLOAD_MODE:-auto}"
+OFFLOAD_VALUE="${OFFLOAD_VALUE:-}"
+FIT_TARGET_MB="${FIT_TARGET_MB:-1024}"
+
+# Batch sizes for prompt processing.
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+UBATCH_SIZE="${UBATCH_SIZE:-4096}"
+
 PARALLEL="${PARALLEL:-1}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
 FLASH_ATTN="${FLASH_ATTN:-on}"
-
-# Reasoning format for hybrid-thinking models (set empty to disable).
 REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
-
-# Extra raw arguments appended to llama-server (e.g. sampling overrides).
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-# Public proxy parameters
+# --- Public proxy ---
 PUBLIC_PORT="${PUBLIC_PORT:-8080}"
-
-# API key for the public endpoint. If unset, the proxy runs WITHOUT auth
-# (DANGEROUS for public deployments — only use this on trusted networks).
 API_KEY="${API_KEY:-}"
-
-# Per-IP rate limit (requests / minute). 0 disables rate limiting.
+API_KEYS="${API_KEYS:-}"
 RATE_LIMIT_PER_MINUTE="${RATE_LIMIT_PER_MINUTE:-60}"
+TRUST_FORWARDED_FOR="${TRUST_FORWARDED_FOR:-false}"
 
-# Make sure the model cache directory exists. Falls back to /models inside
-# the container if /data is not mounted.
+# Fall back from /data/models to /models if /data is not mounted.
 if [ ! -d "$(dirname "$MODEL_DIR")" ]; then
     echo "[start.sh] WARNING: parent of MODEL_DIR ($MODEL_DIR) does not exist."
     echo "[start.sh] Falling back to /models inside the container."
@@ -70,20 +75,35 @@ fi
 TARGET_DIR="${MODEL_DIR}/${MODEL_REPO//\//_}"
 mkdir -p "$TARGET_DIR"
 
-echo "==============================================================="
-echo "  GGUF Server (Salad / Vast.ai / VPS)"
-echo "==============================================================="
-echo "  MODEL_REPO       = ${MODEL_REPO}"
-echo "  MODEL_PATTERN    = ${MODEL_PATTERN}"
-echo "  MMPROJ_PATTERN   = ${MMPROJ_PATTERN:-<none>}"
-echo "  MODEL_ALIAS      = ${MODEL_ALIAS}"
-echo "  TARGET_DIR       = ${TARGET_DIR}"
-echo "  CTX_SIZE         = ${CTX_SIZE}"
-echo "  PARALLEL         = ${PARALLEL}"
-echo "  PUBLIC_PORT      = ${PUBLIC_PORT}"
-echo "  API_KEY          = $([ -n "$API_KEY" ] && echo '<set>' || echo '<NOT SET — public access!>')"
-echo "  RATE_LIMIT/min   = ${RATE_LIMIT_PER_MINUTE}"
-echo "==============================================================="
+# Determine auth status for the banner.
+if [ -n "$API_KEYS" ]; then
+    AUTH_STATUS="<set: $(echo "$API_KEYS" | tr ',' '\n' | wc -l) keys>"
+elif [ -n "$API_KEY" ]; then
+    AUTH_STATUS="<set: 1 key>"
+else
+    AUTH_STATUS="<NOT SET — public access!>"
+fi
+
+cat <<EOF
+===============================================================
+  GGUF Server (Salad / Vast.ai / VPS)
+===============================================================
+  MODEL_REPO         = ${MODEL_REPO}
+  MODEL_PATTERN      = ${MODEL_PATTERN}
+  MMPROJ_PATTERN     = ${MMPROJ_PATTERN:-<none>}
+  MODEL_ALIAS        = ${MODEL_ALIAS}
+  TARGET_DIR         = ${TARGET_DIR}
+  CTX_SIZE           = ${CTX_SIZE}
+  OFFLOAD_MODE       = ${OFFLOAD_MODE}${OFFLOAD_VALUE:+ ($OFFLOAD_VALUE)}
+  BATCH/UBATCH       = ${BATCH_SIZE}/${UBATCH_SIZE}
+  PARALLEL           = ${PARALLEL}
+  PUBLIC_PORT        = ${PUBLIC_PORT}
+  AUTH               = ${AUTH_STATUS}
+  TRUST_FWD_FOR      = ${TRUST_FORWARDED_FOR}
+  RATE_LIMIT/min     = ${RATE_LIMIT_PER_MINUTE}
+  HF_TOKEN           = $([ -n "${HF_TOKEN:-}" ] && echo '<set>' || echo '<not set — downloads will be slower>')
+===============================================================
+EOF
 
 # -----------------------------------------------------------------------------
 # Step 1: Download the model if needed.
@@ -138,13 +158,46 @@ llama_args=(
     --host 127.0.0.1
     --port "$LLAMA_INTERNAL_PORT"
     --ctx-size "$CTX_SIZE"
-    --n-gpu-layers "$N_GPU_LAYERS"
+    --batch-size "$BATCH_SIZE"
+    --ubatch-size "$UBATCH_SIZE"
     --parallel "$PARALLEL"
     --cache-type-k "$CACHE_TYPE_K"
     --cache-type-v "$CACHE_TYPE_V"
     --jinja
     --no-context-shift
 )
+
+case "$OFFLOAD_MODE" in
+    auto)
+        llama_args+=(--fit-target "$FIT_TARGET_MB")
+        echo "[start.sh] Offload: auto-fit (recommended)."
+        ;;
+    ngl)
+        ngl_value="${OFFLOAD_VALUE:-999}"
+        llama_args+=(--n-gpu-layers "$ngl_value")
+        echo "[start.sh] Offload: classic ngl=${ngl_value}."
+        ;;
+    cmoe)
+        llama_args+=(--cpu-moe)
+        echo "[start.sh] Offload: cmoe (all MoE experts on CPU)."
+        ;;
+    ncmoe)
+        if [ -z "$OFFLOAD_VALUE" ]; then
+            echo "[start.sh] ERROR: OFFLOAD_MODE=ncmoe requires OFFLOAD_VALUE."
+            exit 1
+        fi
+        llama_args+=(--n-cpu-moe "$OFFLOAD_VALUE")
+        echo "[start.sh] Offload: ncmoe=${OFFLOAD_VALUE}."
+        ;;
+    manual)
+        echo "[start.sh] Offload: manual (rely on EXTRA_ARGS)."
+        ;;
+    *)
+        echo "[start.sh] ERROR: unknown OFFLOAD_MODE='${OFFLOAD_MODE}'."
+        echo "[start.sh] Valid: auto, ngl, cmoe, ncmoe, manual."
+        exit 1
+        ;;
+esac
 
 if [ "$FLASH_ATTN" = "on" ]; then
     llama_args+=(--flash-attn on)
@@ -170,10 +223,12 @@ fi
 
 mkdir -p /var/log
 echo "[start.sh] Launching llama-server on 127.0.0.1:${LLAMA_INTERNAL_PORT}..."
+echo "[start.sh] Full command: llama-server ${llama_args[*]}"
+
 /app/llama.cpp/llama-server "${llama_args[@]}" > /var/log/llama.log 2>&1 &
 LLAMA_PID=$!
 
-# Cleanup on exit
+# Cleanup on exit.
 cleanup() {
     echo "[start.sh] Shutting down..."
     if kill -0 "$LLAMA_PID" 2>/dev/null; then
@@ -185,7 +240,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[start.sh] Waiting for llama-server to become ready (up to 10 minutes)..."
+echo "[start.sh] Waiting for llama-server (up to 10 minutes)..."
 READY=0
 for i in $(seq 1 600); do
     if curl -sf "http://127.0.0.1:${LLAMA_INTERNAL_PORT}/health" > /dev/null 2>&1; then
@@ -208,28 +263,34 @@ if [ "$READY" -eq 0 ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Step 4: Export config for the proxy and start it in the foreground.
+# Step 4: Export config for the proxy and start it.
 # -----------------------------------------------------------------------------
 
 export UPSTREAM_URL="http://127.0.0.1:${LLAMA_INTERNAL_PORT}"
 export PUBLIC_PORT
 export API_KEY
+export API_KEYS
 export RATE_LIMIT_PER_MINUTE
 export MODEL_ALIAS
+export TRUST_FORWARDED_FOR
 
-echo "[start.sh] Starting auth proxy on 0.0.0.0:${PUBLIC_PORT}..."
+echo "[start.sh] Starting auth proxy on [::]:${PUBLIC_PORT} (IPv4+IPv6)..."
 
-# Run proxy in background and wait on either process — if llama-server
-# crashes mid-flight we want to exit so the orchestrator restarts us.
+# IMPORTANT: --host :: makes the socket dual-stack (IPv4 + IPv6). Salad's
+# Container Gateway routes incoming traffic over IPv6, so a process bound
+# to 0.0.0.0 (IPv4-only) is unreachable from outside and Salad returns 503
+# for every request. `::` works on every platform we target, so we always
+# use it — IPv4-only platforms (Vast, RunPod, generic VPS) still accept
+# IPv4 connections via the dual-stack mapping.
 uvicorn proxy:app \
-    --host 0.0.0.0 \
+    --host :: \
     --port "$PUBLIC_PORT" \
     --workers 1 \
     --log-level info \
     --timeout-keep-alive 75 &
 PROXY_PID=$!
 
-# Wait until either process exits, then exit with that code.
+# Exit when either process dies so the orchestrator can restart us.
 wait -n "$LLAMA_PID" "$PROXY_PID"
 EXIT_CODE=$?
 echo "[start.sh] One of the processes exited with code ${EXIT_CODE}. Shutting down."
